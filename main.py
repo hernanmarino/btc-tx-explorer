@@ -7,8 +7,8 @@ from bitcoin.core import CScript
 import random
 import ssl
 from bech32 import bech32_decode, convertbits, decode
-#from bitcoinlib.encoding import addr_bech32_to_pubkeyhash
-import segwit_addr  # Add this import
+
+import segwit_addr 
 
 # --- Helper Functions ---
 def address_to_scripthash(address_str: str) -> str:
@@ -127,28 +127,40 @@ class ElectrumXClient:
             await self.writer.wait_closed()
             print("Connection closed.")
 
-    async def send_request(self, method: str, params: list) -> dict:
-        try:
-            self.id_counter += 1
-            req = {"id": self.id_counter, "method": method, "params": params}
-            req_str = json.dumps(req) + "\n"
-            self.writer.write(req_str.encode())
-            await self.writer.drain()
-            
-            # Add timeout to read operation
+    async def send_request(self, method: str, params: list, retries=3) -> dict:
+        """Send request to Electrum server with retries and backoff"""
+        for attempt in range(retries):
             try:
-                line = await asyncio.wait_for(self.reader.readline(), timeout=10.0)  # 10 second timeout
-            except asyncio.TimeoutError:
-                print(f"Timeout waiting for response to {method} with params {params}")
+                self.id_counter += 1
+                req = {"id": self.id_counter, "method": method, "params": params}
+                req_str = json.dumps(req) + "\n"
+                self.writer.write(req_str.encode())
+                await self.writer.drain()
+                
+                try:
+                    # Match server timeout (slightly less to account for network latency)
+                    line = await asyncio.wait_for(self.reader.readline(), timeout=28.0)
+                    if not line:
+                        raise Exception("No response; connection may be closed.")
+                    response = json.loads(line.decode())
+                    
+                    # Add exponential backoff between requests to avoid overwhelming server
+                    await asyncio.sleep(0.1 * (2 ** attempt))
+                    return response
+                except asyncio.TimeoutError:
+                    if attempt < retries - 1:
+                        print(f"Server busy, retrying {method} (attempt {attempt + 1}/{retries})...")
+                        # Exponential backoff before retry
+                        await asyncio.sleep(1 * (2 ** attempt))
+                        continue
+                    raise
+            except Exception as e:
+                if attempt < retries - 1:
+                    print(f"Error, retrying {method}...")
+                    await asyncio.sleep(1 * (2 ** attempt))
+                    continue
+                print(f"Error in send_request for {method}: {e}")
                 raise
-            
-            if not line:
-                raise Exception("No response; connection may be closed.")
-            response = json.loads(line.decode())
-            return response
-        except Exception as e:
-            print(f"Error in send_request for {method}: {e}")
-            raise
 
     async def get_history(self, scripthash: str) -> list:
         resp = await self.send_request("blockchain.scripthash.get_history", [scripthash])
@@ -156,9 +168,16 @@ class ElectrumXClient:
 
     async def get_transaction(self, tx_hash: str, verbose=True) -> dict:
         """Get transaction details. Set verbose=True to include input addresses"""
-        # Add verbose parameter to the request
-        resp = await self.send_request("blockchain.transaction.get", [tx_hash, 1])  # 1 for verbose
-        return resp.get("result", {})
+        try:
+            resp = await self.send_request("blockchain.transaction.get", [tx_hash, 1])  # 1 for verbose
+            result = resp.get("result", {})
+            # Handle case where result is a string (raw tx) or list
+            if isinstance(result, (str, list)):
+                return {"vin": [], "vout": []}
+            return result
+        except Exception as e:
+            print(f"Error getting transaction {tx_hash}: {e}")
+            return {"vin": [], "vout": []}
 
     async def get_input_address(self, txid: str, vout: int) -> str:
         """Get address from a specific output of a transaction"""
@@ -298,29 +317,50 @@ class AddressCluster:
                 self.add_address(output_addresses[0])
 
             # Script type consistency heuristic for change detection
-            input_script_types = get_input_script_types(input_addresses)
-            if len(input_script_types) == 1:  # All inputs have same script type
-                input_script_type = input_script_types.pop()
-                # Check each output
-                for vout in vouts:
-                    output_script_types = get_output_script_types(vout)
-                    # If only one output matches input script type, it's likely change
-                    if len(output_script_types) == 1 and output_script_types[0] == input_script_type:
-                        for addr in extract_output_addresses(vout):
-                            if not self.is_own_address(addr):
-                                print(f"Script type consistency: Found likely change address {addr}")
-                                self.add_change_address(addr)
+            if any(self.is_own_address(addr) for addr in input_addresses):
+                # We own at least one input, check for change outputs
+                input_script_types = get_input_script_types(input_addresses)
+                if len(input_script_types) == 1:  # All inputs have same script type
+                    input_script_type = input_script_types.pop()
+                    # Check each output
+                    for vout in vouts:
+                        output_script_types = get_output_script_types(vout)
+                        # If only one output matches input script type, it's likely change
+                        if len(output_script_types) == 1 and output_script_types[0] == input_script_type:
+                            for addr in extract_output_addresses(vout):
+                                if not self.is_own_address(addr):
+                                    print(f"Script type consistency: Found likely change address {addr}")
+                                    self.add_change_address(addr)
 
         # --- Case 2: We own one of the outputs ---
         if any(self.is_own_address(addr) for addr in output_addresses):
-            # Single output case: if we own it, likely consolidation, so inputs are ours
+            # Check script type consistency first (strong heuristic)
+            input_script_types = get_input_script_types(input_addresses)
+            if len(input_script_types) == 1:  # All inputs have same script type
+                input_script_type = input_script_types.pop()
+                # Count outputs matching input script type
+                matching_type_outputs = []
+                for i, vout in enumerate(vouts):
+                    output_script_types = get_output_script_types(vout)
+                    if len(output_script_types) == 1 and output_script_types[0] == input_script_type:
+                        matching_type_outputs.append(i)
+                
+                # If exactly one output matches input type and we own it, we own all inputs
+                if len(matching_type_outputs) == 1:
+                    vout = vouts[matching_type_outputs[0]]
+                    if any(self.is_own_address(addr) for addr in extract_output_addresses(vout)):
+                        print(f"Script type consistency: We own the only output matching input type")
+                        for addr in input_addresses:
+                            self.add_address(addr)
+
+            # Continue with existing round number heuristics
             if len(output_addresses) == 1:
+                # Single output case: if we own it, likely consolidation
                 for addr in input_addresses:
                     self.add_address(addr)
             
-            # Two outputs case: need to determine if we're sender or receiver
             elif len(output_addresses) == 2:
-                # Find our output index
+                # Two outputs case: check round number heuristic
                 our_output_idx = None
                 for i, vout in enumerate(vouts):
                     addrs = extract_output_addresses(vout)
@@ -331,21 +371,10 @@ class AddressCluster:
                 if our_output_idx is not None:
                     amounts = [v.get("value", 0) for v in vouts]
                     other_idx = 1 - our_output_idx
-                    # We're the sender if:
-                    # 1. Our output is non-round (change address) AND
-                    # 2. The other output is round (payment)
+                    # We're the sender if our output is non-round AND other is round
                     if not is_round_number(amounts[our_output_idx]) and is_round_number(amounts[other_idx]):
-                        # We're the sender, so we own all inputs
                         for addr in input_addresses:
                             self.add_address(addr)
-                        
-                        # Apply script type consistency check for additional confidence
-                        input_script_types = get_input_script_types(input_addresses)
-                        if len(input_script_types) == 1:
-                            input_script_type = input_script_types.pop()
-                            our_output_script_types = get_output_script_types(vouts[our_output_idx])
-                            if len(our_output_script_types) == 1 and our_output_script_types[0] == input_script_type:
-                                print(f"Script type consistency confirms change address pattern")
 
 # --- Recursive Tracing Function ---
 async def trace_inputs(tx_hash, client, visited, cluster, depth=0, max_depth=16):
@@ -415,7 +444,13 @@ async def trace_outputs(address, client, visited, cluster, depth=0, max_depth=16
         scripthash = address_to_scripthash(address)
         print(f"Getting history for {address}")  # Debug print
         history = await client.get_history(scripthash)
-        print(f"Found {len(history)} transactions for {address}")  # Debug print
+        tx_count = len(history)
+        print(f"Found {tx_count} transactions for {address}")  # Debug print
+        
+        # Skip addresses with too many transactions
+        if tx_count > 100:
+            print(f"WARNING: Address {address} has too many transactions ({tx_count}). Skipping to avoid timeout.")
+            return
         
         for item in history:
             tx_hash = item.get("tx_hash")
