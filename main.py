@@ -6,17 +6,35 @@ from bitcoin.wallet import CBitcoinAddress
 from bitcoin.core import CScript
 import random
 import ssl
+from bech32 import bech32_decode, convertbits, decode
+#from bitcoinlib.encoding import addr_bech32_to_pubkeyhash
+import segwit_addr  # Add this import
 
 # --- Helper Functions ---
 def address_to_scripthash(address_str: str) -> str:
     """
-    Electrum scripthash is the SHA256 of the scriptPubKey (in binary),
-    then the resulting hash is reversed (i.e. little-endian hex).
+    Convert address to scripthash with Taproot support.
     """
-    addr = CBitcoinAddress(address_str)
-    script = addr.to_scriptPubKey()
-    h = hashlib.sha256(bytes(script)).digest()
-    return h[::-1].hex()
+    try:
+        # First try the standard bitcoin library conversion
+        addr = CBitcoinAddress(address_str)
+        script = addr.to_scriptPubKey()
+        h = hashlib.sha256(bytes(script)).digest()
+        return h[::-1].hex()
+    except Exception as e:
+        # Handle Taproot (P2TR) addresses using segwit_addr
+        if address_str.startswith('bc1p'):
+            # Decode Taproot address using segwit_addr
+            witver, witprog = segwit_addr.decode('bc', address_str)
+            if witver is None or witver != 1 or len(witprog) != 32:
+                raise ValueError(f"Invalid Taproot address: {address_str}")
+            
+            # Create P2TR script
+            script = bytes([0x51, 0x20]) + bytes(witprog)  # 0x51 is OP_1, 0x20 is push 32 bytes
+            h = hashlib.sha256(script).digest()
+            return h[::-1].hex()
+        else:
+            raise ValueError(f"Unsupported address format: {address_str}")
 
 def is_coinbase(tx: dict) -> bool:
     vin = tx.get("vin", [])
@@ -110,16 +128,27 @@ class ElectrumXClient:
             print("Connection closed.")
 
     async def send_request(self, method: str, params: list) -> dict:
-        self.id_counter += 1
-        req = {"id": self.id_counter, "method": method, "params": params}
-        req_str = json.dumps(req) + "\n"
-        self.writer.write(req_str.encode())
-        await self.writer.drain()
-        line = await self.reader.readline()
-        if not line:
-            raise Exception("No response; connection may be closed.")
-        response = json.loads(line.decode())
-        return response
+        try:
+            self.id_counter += 1
+            req = {"id": self.id_counter, "method": method, "params": params}
+            req_str = json.dumps(req) + "\n"
+            self.writer.write(req_str.encode())
+            await self.writer.drain()
+            
+            # Add timeout to read operation
+            try:
+                line = await asyncio.wait_for(self.reader.readline(), timeout=10.0)  # 10 second timeout
+            except asyncio.TimeoutError:
+                print(f"Timeout waiting for response to {method} with params {params}")
+                raise
+            
+            if not line:
+                raise Exception("No response; connection may be closed.")
+            response = json.loads(line.decode())
+            return response
+        except Exception as e:
+            print(f"Error in send_request for {method}: {e}")
+            raise
 
     async def get_history(self, scripthash: str) -> list:
         resp = await self.send_request("blockchain.scripthash.get_history", [scripthash])
@@ -321,11 +350,15 @@ class AddressCluster:
 # --- Recursive Tracing Function ---
 async def trace_inputs(tx_hash, client, visited, cluster, depth=0, max_depth=16):
     try:
+        print(f"Depth: {depth}, Visited transactions: {len(visited)}")  # Debug print
+        
         if tx_hash in visited or depth >= max_depth:
+            print(f"Stopping trace: {'Already visited' if tx_hash in visited else 'Max depth reached'}")
             return
         visited.add(tx_hash)
         
         try:
+            print(f"Fetching transaction {tx_hash}")  # Debug print
             tx = await client.get_transaction(tx_hash)
         except Exception as e:
             print(f"Error fetching transaction {tx_hash}: {e}")
@@ -373,14 +406,16 @@ async def trace_inputs(tx_hash, client, visited, cluster, depth=0, max_depth=16)
 
 # Add this new function after trace_inputs:
 async def trace_outputs(address, client, visited, cluster, depth=0, max_depth=16):
-    """Trace forward by following outputs of transactions that involve this address"""
+    print(f"Tracing outputs for {address} at depth {depth}")  # Debug print
     if depth >= max_depth:
+        print(f"Max depth reached for address {address}")
         return
         
     try:
-        # Get transaction history for this address
         scripthash = address_to_scripthash(address)
+        print(f"Getting history for {address}")  # Debug print
         history = await client.get_history(scripthash)
+        print(f"Found {len(history)} transactions for {address}")  # Debug print
         
         for item in history:
             tx_hash = item.get("tx_hash")
@@ -423,7 +458,7 @@ async def main():
     try:
         client = await ElectrumXClient.create_with_fallback()
         #initial_addr = "bc1qqrulkslglepwe4cenge7wa7mrje0n0vkrd48l2"
-        initial_addr = ""
+        initial_addr = "bc1pknqtmct768xd8ulr5ulnptmkddemzsr4s0s46xf58krlsqdw89tsx9ssya"
         cluster = AddressCluster(initial_addr)
         scripthash = address_to_scripthash(initial_addr)
         print(f"Address: {initial_addr}")
