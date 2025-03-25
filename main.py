@@ -9,6 +9,7 @@ import ssl
 from bech32 import bech32_decode, convertbits, decode
 
 import segwit_addr 
+import socket
 
 # --- Helper Functions ---
 def address_to_scripthash(address_str: str) -> str:
@@ -128,36 +129,65 @@ class ElectrumXClient:
             print("Connection closed.")
 
     async def send_request(self, method: str, params: list, retries=3) -> dict:
-        """Send request to Electrum server with retries and backoff"""
+        """Send request to Electrum server with retries, backoff, and reconnection"""
+        MAX_BACKOFF = 10.0  # Maximum backoff time in seconds
+        
         for attempt in range(retries):
             try:
                 self.id_counter += 1
                 req = {"id": self.id_counter, "method": method, "params": params}
                 req_str = json.dumps(req) + "\n"
-                self.writer.write(req_str.encode())
-                await self.writer.drain()
                 
                 try:
+                    self.writer.write(req_str.encode())
+                    await self.writer.drain()
+                    
                     # Match server timeout (slightly less to account for network latency)
                     line = await asyncio.wait_for(self.reader.readline(), timeout=28.0)
                     if not line:
-                        raise Exception("No response; connection may be closed.")
+                        raise ConnectionError("No response; connection may be closed.")
                     response = json.loads(line.decode())
                     
-                    # Add exponential backoff between requests to avoid overwhelming server
-                    await asyncio.sleep(0.1 * (2 ** attempt))
+                    # Add capped exponential backoff between requests
+                    backoff = min(0.1 * (2 ** attempt), MAX_BACKOFF)
+                    await asyncio.sleep(backoff)
                     return response
+                    
+                except (ConnectionError, BrokenPipeError, socket.error) as e:
+                    print(f"Connection lost ({str(e)}), attempting to reconnect...")
+                    # Try to reconnect
+                    if await self.connect():
+                        print("Reconnected successfully, retrying request...")
+                        # Reset attempt counter after successful reconnection
+                        attempt = 0
+                        continue
+                    else:
+                        print("Reconnection failed, trying another server...")
+                        # Try a different server
+                        host, port, use_ssl = self.get_random_public_server()
+                        self.host = host
+                        self.port = port
+                        self.use_ssl = use_ssl
+                        if await self.connect():
+                            print(f"Connected to new server {host}:{port}, retrying request...")
+                            # Reset attempt counter after successful server switch
+                            attempt = 0
+                            continue
+                        raise
+                        
                 except asyncio.TimeoutError:
                     if attempt < retries - 1:
                         print(f"Server busy, retrying {method} (attempt {attempt + 1}/{retries})...")
-                        # Exponential backoff before retry
-                        await asyncio.sleep(1 * (2 ** attempt))
+                        backoff = min(1.0 * (2 ** attempt), MAX_BACKOFF)
+                        await asyncio.sleep(backoff)
                         continue
                     raise
+                    
             except Exception as e:
                 if attempt < retries - 1:
                     print(f"Error, retrying {method}...")
-                    await asyncio.sleep(1 * (2 ** attempt))
+                    backoff = min(1.0 * (2 ** attempt), MAX_BACKOFF)
+                    await asyncio.sleep(backoff)
                     continue
                 print(f"Error in send_request for {method}: {e}")
                 raise
@@ -411,10 +441,9 @@ async def trace_inputs(tx_hash, client, visited, cluster, depth=0, max_depth=16)
         cluster.analyze_transaction(tx)
 
         found_related = any(
-            cluster.is_own_address(extract_input_address(vin))
-            for vin in tx.get("vin", [])
-            if extract_input_address(vin) is not None
+            cluster.is_own_address(addr) for addr in input_addresses
         )
+
         if not found_related:
             print(f"Stopping trace at transaction {tx_hash} (no related inputs)")
             return
@@ -493,7 +522,8 @@ async def main():
     try:
         client = await ElectrumXClient.create_with_fallback()
         #initial_addr = "bc1qqrulkslglepwe4cenge7wa7mrje0n0vkrd48l2"
-        initial_addr = "bc1pknqtmct768xd8ulr5ulnptmkddemzsr4s0s46xf58krlsqdw89tsx9ssya"
+        initial_addr = "3DUGZoZzGt6WQZswE5MkpBvNdUwKe3nqLx"
+        #initial_addr = "bc1pknqtmct768xd8ulr5ulnptmkddemzsr4s0s46xf58krlsqdw89tsx9ssya"
         cluster = AddressCluster(initial_addr)
         scripthash = address_to_scripthash(initial_addr)
         print(f"Address: {initial_addr}")
