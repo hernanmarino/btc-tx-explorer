@@ -6,6 +6,13 @@ import ssl
 from helpers import address_to_scripthash
 
 class ElectrumXClient:
+    """
+    A client for interacting with ElectrumX servers.
+    
+    This class provides methods to connect to and communicate with ElectrumX servers,
+    supporting both local and public servers with automatic fallback mechanisms.
+    """
+    
     # List of known public servers (you can add more)
     PUBLIC_SERVERS = [
         ("electrum.blockstream.info", 50002, True),  # (host, port, is_ssl)
@@ -25,7 +32,15 @@ class ElectrumXClient:
         ("electrum3.bluewallet.io", 50002, True),   # Maintained by BlueWallet
     ]
 
-    def __init__(self, host: str, port: int, use_ssl=False):
+    def __init__(self, host: str, port: int, use_ssl: bool = False):
+        """
+        Initialize the ElectrumX client.
+        
+        Args:
+            host (str): The hostname of the ElectrumX server.
+            port (int): The port number of the ElectrumX server.
+            use_ssl (bool, optional): Whether to use SSL for the connection. Defaults to False.
+        """
         self.host = host
         self.port = port
         self.use_ssl = use_ssl
@@ -34,12 +49,25 @@ class ElectrumXClient:
         self.id_counter = 0
 
     @classmethod
-    def get_random_public_server(cls):
-        """Returns a random public server from the list"""
+    def get_random_public_server(cls) -> tuple:
+        """
+        Get a random public ElectrumX server from the predefined list.
+        
+        Returns:
+            tuple: A tuple containing (host, port, use_ssl) for a random server.
+        """
         return random.choice(cls.PUBLIC_SERVERS)
 
-    async def connect(self):
-        """Try to connect, with fallback to public servers if local fails"""
+    async def connect(self) -> bool:
+        """
+        Establish a connection to the ElectrumX server.
+        
+        This method attempts to connect to the server using either SSL or plain TCP,
+        depending on the use_ssl flag set during initialization.
+        
+        Returns:
+            bool: True if the connection was successful, False otherwise.
+        """
         try:
             if self.use_ssl:
                 ssl_context = ssl.create_default_context()
@@ -65,7 +93,18 @@ class ElectrumXClient:
 
     @classmethod
     async def create_with_fallback(cls):
-        """Factory method that tries local server first, then falls back to public servers"""
+        """
+        Create a client instance with automatic fallback to public servers.
+        
+        This factory method first attempts to connect to a local ElectrumX server.
+        If that fails, it tries connecting to public servers in random order.
+        
+        Returns:
+            ElectrumXClient: An initialized and connected client instance.
+            
+        Raises:
+            ConnectionRefusedError: If unable to connect to any server.
+        """
         # Try local server first
         client = cls("127.0.0.1", 50001, False)
         if await client.connect():
@@ -85,14 +124,37 @@ class ElectrumXClient:
 
         raise ConnectionRefusedError("Failed to connect to any Electrum server")
 
-    async def close(self):
+    async def close(self) -> None:
+        """
+        Close the connection to the ElectrumX server.
+        
+        This method properly closes the writer and waits for the connection
+        to be fully closed.
+        """
         if self.writer:
             self.writer.close()
             await self.writer.wait_closed()
             print("Connection closed.")
 
-    async def send_request(self, method: str, params: list, retries=3) -> dict:
-        """Send request to Electrum server with retries, backoff, and reconnection"""
+    async def send_request(self, method: str, params: list, retries: int = 3) -> dict:
+        """
+        Send a request to the ElectrumX server with retry logic.
+        
+        This method implements exponential backoff and automatic reconnection
+        in case of connection issues. It also handles server timeouts and
+        connection errors gracefully.
+        
+        Args:
+            method (str): The RPC method to call.
+            params (list): The parameters for the RPC method.
+            retries (int, optional): Number of retry attempts. Defaults to 3.
+            
+        Returns:
+            dict: The server's response.
+            
+        Raises:
+            Exception: If all retry attempts fail.
+        """
         max_backoff = 10.0  # Maximum backoff time in seconds
 
         for attempt in range(retries):
@@ -157,11 +219,28 @@ class ElectrumXClient:
                 raise
 
     async def get_history(self, scripthash: str) -> list:
+        """
+        Get the transaction history for a scripthash.
+        
+        Args:
+            scripthash (str): The scripthash to query.
+            
+        Returns:
+            list: List of transactions associated with the scripthash.
+        """
         resp = await self.send_request("blockchain.scripthash.get_history", [scripthash])
         return resp.get("result", [])
 
     async def get_transaction(self, tx_hash: str) -> dict:
-        """Get transaction details. Set verbose=True to include input addresses"""
+        """
+        Get detailed information about a transaction.
+        
+        Args:
+            tx_hash (str): The transaction hash to query.
+            
+        Returns:
+            dict: Transaction details including inputs and outputs.
+        """
         try:
             resp = await self.send_request("blockchain.transaction.get", [tx_hash, 1])  # 1 for verbose
             result = resp.get("result", {})
@@ -175,7 +254,16 @@ class ElectrumXClient:
             return {"vin": [], "vout": []}
 
     async def get_input_address(self, txid: str, vout: int) -> str:
-        """Get address from a specific output of a transaction"""
+        """
+        Get the address associated with a specific transaction output.
+        
+        Args:
+            txid (str): The transaction ID.
+            vout (int): The output index.
+            
+        Returns:
+            str: The address associated with the output, or None if not found.
+        """
         try:
             tx = await self.get_transaction(txid)
             if vout < len(tx.get("vout", [])):
@@ -191,7 +279,15 @@ class ElectrumXClient:
         return None
 
     async def get_address_balance(self, address: str) -> dict:
-        """Get balance for a specific address"""
+        """
+        Get the balance for a Bitcoin address.
+        
+        Args:
+            address (str): The Bitcoin address to query.
+            
+        Returns:
+            dict: Dictionary containing confirmed and unconfirmed balances in BTC.
+        """
         scripthash = address_to_scripthash(address)
         resp = await self.send_request("blockchain.scripthash.get_balance", [scripthash])
         result = resp.get("result", {})
