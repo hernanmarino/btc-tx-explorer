@@ -3,13 +3,27 @@ from bitcoin.wallet import CBitcoinAddress
 from bitcoin.base58 import InvalidBase58Error
 import segwit_addr
 
-TX_COUNT_THRESHOLD = 100
-TRACE_MAX_DEPTH = 5
-ROUND_NUMBER_PRECISION = 6
+# Constants
+TX_COUNT_THRESHOLD = 100  # Maximum number of transactions to process per address
+TRACE_MAX_DEPTH = 5      # Maximum depth for transaction tracing
+ROUND_NUMBER_PRECISION = 6  # Decimal places for round number comparison
 
 def address_to_scripthash(address_str: str) -> str:
     """
-    Convert address to scripthash with Taproot support.
+    Convert a Bitcoin address to its corresponding scripthash.
+    
+    This function supports multiple address formats including legacy (P2PKH), 
+    P2SH, SegWit (P2WPKH), and Taproot (P2TR) addresses.
+    
+    Args:
+        address_str (str): The Bitcoin address to convert.
+        
+    Returns:
+        str: The scripthash in hexadecimal format, byte-reversed as required by ElectrumX.
+        
+    Raises:
+        ValueError: If the address format is unsupported or invalid.
+        InvalidBase58Error: If the address contains invalid base58 characters.
     """
     try:
         # First try the standard bitcoin library conversion
@@ -34,17 +48,52 @@ def address_to_scripthash(address_str: str) -> str:
 
 
 def is_coinbase(tx: dict) -> bool:
+    """
+    Check if a transaction is a coinbase transaction.
+    
+    Args:
+        tx (dict): The transaction dictionary to check.
+        
+    Returns:
+        bool: True if the transaction is a coinbase transaction, False otherwise.
+    """
     vin = tx.get("vin", [])
     return len(vin) > 0 and "coinbase" in vin[0]
 
 
-def is_round_number(amount, precision=ROUND_NUMBER_PRECISION):
+def is_round_number(amount: float, precision: int = ROUND_NUMBER_PRECISION) -> bool:
+    """
+    Check if a number is "round" within a given precision.
+    
+    A number is considered "round" if it's close to its rounded value
+    within a small epsilon. This is useful for identifying likely payment
+    amounts in Bitcoin transactions.
+    
+    Args:
+        amount (float): The number to check.
+        precision (int, optional): Number of decimal places to consider. 
+                                 Defaults to ROUND_NUMBER_PRECISION.
+        
+    Returns:
+        bool: True if the number is round, False otherwise.
+    """
     rounded = round(amount, precision)
     return abs(rounded - amount) < 1e-8
 
 
-def extract_input_address(vin):
-    """Extract address from input, considering prevout structure"""
+def extract_input_address(vin: dict) -> str:
+    """
+    Extract the address from a transaction input.
+    
+    This function handles different input formats and structures,
+    including both modern and legacy transaction formats.
+    
+    Args:
+        vin (dict): The transaction input dictionary.
+        
+    Returns:
+        str: The extracted address, or None if no address is found.
+    """
     # In verbose mode, address is directly in the vin
     if "address" in vin:
         return vin["address"]
@@ -59,8 +108,19 @@ def extract_input_address(vin):
     return None
 
 
-def extract_output_addresses(vout):
-    """Extract addresses from output, handling different script types"""
+def extract_output_addresses(vout: dict) -> list:
+    """
+    Extract addresses from a transaction output.
+    
+    This function handles different output formats and script types,
+    including both modern and legacy transaction formats.
+    
+    Args:
+        vout (dict): The transaction output dictionary.
+        
+    Returns:
+        list: List of addresses found in the output.
+    """
     script_pub_key = vout.get("scriptPubKey", {})
     addresses = []
 
@@ -75,9 +135,16 @@ def extract_output_addresses(vout):
     return addresses
 
 
-# Add these helper functions after the existing helper functions:
 def get_script_type(address: str) -> str:
-    """Determine the script type of an address"""
+    """
+    Determine the script type of a Bitcoin address.
+    
+    Args:
+        address (str): The Bitcoin address to analyze.
+        
+    Returns:
+        str: The script type ('p2pkh', 'p2sh', 'p2wpkh', 'p2tr', or 'unknown').
+    """
     if address.startswith('1'):
         return 'p2pkh'  # Legacy
     elif address.startswith('3'):
@@ -90,18 +157,47 @@ def get_script_type(address: str) -> str:
 
 
 def get_input_script_types(input_addresses: list) -> set:
-    """Get unique script types from input addresses"""
+    """
+    Get unique script types from a list of input addresses.
+    
+    Args:
+        input_addresses (list): List of Bitcoin addresses.
+        
+    Returns:
+        set: Set of unique script types found in the addresses.
+    """
     return {get_script_type(addr) for addr in input_addresses if addr}
 
 
 def get_output_script_types(vout: dict) -> list:
-    """Get script types for an output"""
+    """
+    Get script types for all addresses in a transaction output.
+    
+    Args:
+        vout (dict): The transaction output dictionary.
+        
+    Returns:
+        list: List of script types for all addresses in the output.
+    """
     addresses = extract_output_addresses(vout)
     return [get_script_type(addr) for addr in addresses if addr]
 
 
-# --- Recursive Tracing Function ---
-async def trace_inputs(tx_hash, client, visited, cluster, depth=0, max_depth=TRACE_MAX_DEPTH):
+async def trace_inputs(tx_hash: str, client, visited: set, cluster, depth: int = 0, max_depth: int = TRACE_MAX_DEPTH) -> None:
+    """
+    Recursively trace transaction inputs to find related addresses.
+    
+    This function follows the input chain of a transaction to discover
+    addresses that are likely owned by the same entity.
+    
+    Args:
+        tx_hash (str): The transaction hash to trace.
+        client: The ElectrumX client instance.
+        visited (set): Set of already visited transaction hashes.
+        cluster: The AddressCluster instance to update.
+        depth (int, optional): Current recursion depth. Defaults to 0.
+        max_depth (int, optional): Maximum recursion depth. Defaults to TRACE_MAX_DEPTH.
+    """
     try:
         print(f"Depth: {depth}, Visited transactions: {len(visited)}")  # Debug print
 
@@ -158,8 +254,22 @@ async def trace_inputs(tx_hash, client, visited, cluster, depth=0, max_depth=TRA
         print(f"-- DEBUG 466: {type(e)} | {e}")
         print(f"Error processing transaction {tx_hash}: {type(e)} {e} | Cause: {type(e.__cause__)} {e.__cause__}")
 
-# Add this new function after trace_inputs:
-async def trace_outputs(address, client, visited, cluster, depth=0, max_depth=TRACE_MAX_DEPTH):
+
+async def trace_outputs(address: str, client, visited: set, cluster, depth: int = 0, max_depth: int = TRACE_MAX_DEPTH) -> None:
+    """
+    Recursively trace transaction outputs to find related addresses.
+    
+    This function follows the output chain of an address to discover
+    addresses that are likely owned by the same entity.
+    
+    Args:
+        address (str): The Bitcoin address to trace.
+        client: The ElectrumX client instance.
+        visited (set): Set of already visited transaction hashes.
+        cluster: The AddressCluster instance to update.
+        depth (int, optional): Current recursion depth. Defaults to 0.
+        max_depth (int, optional): Maximum recursion depth. Defaults to TRACE_MAX_DEPTH.
+    """
     print(f"Tracing outputs for {address} at depth {depth}")  # Debug print
     if depth >= max_depth:
         print(f"Max depth reached for address {address}")
