@@ -1,17 +1,58 @@
 from helpers import is_round_number, extract_output_addresses, get_input_script_types, get_output_script_types
 
 class AddressCluster:
-    def __init__(self, initial_address):
+    """
+    A class for clustering related Bitcoin addresses.
+    
+    This class maintains a set of addresses that are likely owned by the same entity,
+    using various heuristics to identify related addresses through transaction analysis.
+    """
+    
+    def __init__(self, initial_address: str):
+        """
+        Initialize the address cluster with a starting address.
+        
+        Args:
+            initial_address (str): The first address to add to the cluster.
+        """
         self.addresses = {initial_address}
 
-    def add_address(self, address):
+    def add_address(self, address: str) -> None:
+        """
+        Add an address to the cluster if it's not None.
+        
+        Args:
+            address (str): The address to add to the cluster.
+        """
         if address:
             self.addresses.add(address)
 
-    def is_own_address(self, address):
+    def is_own_address(self, address: str) -> bool:
+        """
+        Check if an address belongs to the cluster.
+        
+        Args:
+            address (str): The address to check.
+            
+        Returns:
+            bool: True if the address is in the cluster, False otherwise.
+        """
         return address in self.addresses
 
-    def analyze_transaction(self, tx):
+    def analyze_transaction(self, tx: dict) -> None:
+        """
+        Analyze a transaction to identify related addresses.
+        
+        This method uses several heuristics to identify addresses that are likely
+        owned by the same entity:
+        1. Common input ownership
+        2. Round number amounts for payments
+        3. Script type consistency
+        4. Single output consolidation
+        
+        Args:
+            tx (dict): The transaction to analyze, containing 'vin' and 'vout' fields.
+        """
         # Get input addresses from our added field
         input_addresses = set(tx.get("input_addresses", []))
 
